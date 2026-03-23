@@ -1,11 +1,16 @@
 /* ============================================================
  *  main.c — d-grape-test-imu
- *  Проверка MPU-6050: вывод ax/ay/az/gx/gy/gz/T в USB CDC
+ *  MPU6050 через I2C1, вывод данных через USB CDC
+ *
+ *  Подключение:
+ *    ST-Link (CN1, Mini-USB)  → прошивка
+ *    USB OTG (CN5, Micro-USB) → COM-порт (CDC)
+ *    PB6 → I2C1_SCL
+ *    PB7 → I2C1_SDA
+ *    AD0 → GND (адрес 0x68)
  *
  *  Ожидаемые значения в покое (плата горизонтально):
- *    az ≈ ±9.81 м/с²   (зависит от ориентации)
- *    gx,gy,gz ≈ 0      (небольшой шум)
- *    T ≈ 25-40 °C
+ *    az ≈ ±9.81 м/с², ax/ay ≈ 0, gx/gy/gz ≈ 0
  * ============================================================ */
 
 #include "main.h"
@@ -36,7 +41,8 @@ static void MX_I2C1_Init(void);
 
 void Error_Handler(void)
 {
-    GPIOE->BSRR = GPIO_PIN_1;
+    /* PD14 = красный LED на Discovery */
+    HAL_GPIO_WritePin(GPIOD, GPIO_PIN_14, GPIO_PIN_SET);
     while (1) {}
 }
 
@@ -48,19 +54,25 @@ int main(void)
     MX_GPIO_Init();
     MX_I2C1_Init();
     MX_USB_DEVICE_Init();
-    HAL_Delay(500U);
+    HAL_Delay(2000U);   /* ждём энумерацию USB */
 
     if (imu_init(&hi2c1) != HAL_OK) {
-        const char *err = "IMU init FAILED — проверь подключение MPU-6050\r\n";
-        cdc_send(err, (uint16_t)strlen(err));
-        GPIOE->BSRR = GPIO_PIN_1;  /* PE1 красный = ошибка */
+        uint8_t who = imu_whoami(&hi2c1);
+        char err[80];
+        int n = snprintf(err, sizeof(err),
+            "IMU init FAILED — WHO_AM_I = 0x%02X (ожидалось 0x68)\r\n",
+            (unsigned)who);
+        if (n > 0) cdc_send(err, (uint16_t)n);
+        HAL_GPIO_WritePin(GPIOD, GPIO_PIN_14, GPIO_PIN_SET); /* красный */
         while (1) {}
     }
 
     const char *banner =
-        "\r\n=== d-grape-test-imu: MPU-6050 ===\r\n"
-        "ax[m/s2]  ay       az       gx[rad/s] gy       gz       T[C]\r\n"
-        "--------------------------------------------------------------------\r\n";
+        "\r\n=== d-grape-test-imu: MPU6050 ===\r\n"
+        " ax[m/s2]   ay[m/s2]   az[m/s2]"
+        "   gx[r/s]   gy[r/s]   gz[r/s]"
+        "   t[C]\r\n"
+        "-----------------------------------------------------------\r\n";
     cdc_send(banner, (uint16_t)strlen(banner));
 
     HAL_GPIO_WritePin(GPIOD, GPIO_PIN_12, GPIO_PIN_SET); /* зелёный = IMU OK */
@@ -81,9 +93,9 @@ int main(void)
         /* Вывод 10 Гц */
         if (now - last_print >= 100U) {
             last_print = now;
-            char buf[128];
+            char buf[96];
             int n = snprintf(buf, sizeof(buf),
-                "%7.3f   %7.3f   %7.3f   %7.4f   %7.4f   %7.4f   %5.1f\r\n",
+                "%9.4f  %9.4f  %9.4f  %8.4f  %8.4f  %8.4f  %6.2f\r\n",
                 (double)imu.ax, (double)imu.ay, (double)imu.az,
                 (double)imu.gx, (double)imu.gy, (double)imu.gz,
                 (double)imu.temp_c);
@@ -93,59 +105,58 @@ int main(void)
     }
 }
 
-/* ── Тактирование 168 МГц ───────────────────────────────────*/
+/* ── Тактирование 168 МГц (HSE 8 МГц) ──────────────────────*/
 static void SystemClock_Config(void)
 {
     RCC_OscInitTypeDef osc = {0};
     RCC_ClkInitTypeDef clk = {0};
 
-    osc.OscillatorType      = RCC_OSCILLATORTYPE_HSE;
-    osc.HSEState            = RCC_HSE_ON;
-    osc.PLL.PLLState        = RCC_PLL_ON;
-    osc.PLL.PLLSource       = RCC_PLLSOURCE_HSE;
-    osc.PLL.PLLM            = 8;
-    osc.PLL.PLLN            = 336;
-    osc.PLL.PLLP            = RCC_PLLP_DIV2;
-    osc.PLL.PLLQ            = 7;
+    osc.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+    osc.HSEState       = RCC_HSE_ON;
+    osc.PLL.PLLState   = RCC_PLL_ON;
+    osc.PLL.PLLSource  = RCC_PLLSOURCE_HSE;
+    osc.PLL.PLLM       = 8;
+    osc.PLL.PLLN       = 336;
+    osc.PLL.PLLP       = RCC_PLLP_DIV2;   /* SYSCLK = 168 МГц */
+    osc.PLL.PLLQ       = 7;               /* USB = 48 МГц     */
     HAL_RCC_OscConfig(&osc);
 
     clk.ClockType      = RCC_CLOCKTYPE_SYSCLK | RCC_CLOCKTYPE_HCLK |
                          RCC_CLOCKTYPE_PCLK1  | RCC_CLOCKTYPE_PCLK2;
     clk.SYSCLKSource   = RCC_SYSCLKSOURCE_PLLCLK;
     clk.AHBCLKDivider  = RCC_SYSCLK_DIV1;
-    clk.APB1CLKDivider = RCC_HCLK_DIV4;
-    clk.APB2CLKDivider = RCC_HCLK_DIV2;
+    clk.APB1CLKDivider = RCC_HCLK_DIV4;   /* PCLK1 = 42 МГц */
+    clk.APB2CLKDivider = RCC_HCLK_DIV2;   /* PCLK2 = 84 МГц */
     HAL_RCC_ClockConfig(&clk, FLASH_LATENCY_5);
 }
 
-/* ── GPIO: LED + DIR pins ───────────────────────────────────*/
+/* ── GPIO: LEDs (PD12-PD15) ─────────────────────────────────*/
 static void MX_GPIO_Init(void)
 {
     __HAL_RCC_GPIOD_CLK_ENABLE();
-    __HAL_RCC_GPIOE_CLK_ENABLE();
+    __HAL_RCC_GPIOA_CLK_ENABLE();
 
     GPIO_InitTypeDef gpio = {0};
     gpio.Mode  = GPIO_MODE_OUTPUT_PP;
     gpio.Pull  = GPIO_NOPULL;
     gpio.Speed = GPIO_SPEED_FREQ_LOW;
 
+    /* PD12=зелёный, PD13=оранжевый, PD14=красный, PD15=синий */
     gpio.Pin = GPIO_PIN_12 | GPIO_PIN_13 | GPIO_PIN_14 | GPIO_PIN_15;
     HAL_GPIO_Init(GPIOD, &gpio);
-    gpio.Pin = GPIO_PIN_1;
-    HAL_GPIO_Init(GPIOE, &gpio);
-
-    HAL_GPIO_WritePin(GPIOD, GPIO_PIN_12|GPIO_PIN_13|GPIO_PIN_14|GPIO_PIN_15, GPIO_PIN_RESET);
-    HAL_GPIO_WritePin(GPIOE, GPIO_PIN_1, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(GPIOD,
+        GPIO_PIN_12 | GPIO_PIN_13 | GPIO_PIN_14 | GPIO_PIN_15,
+        GPIO_PIN_RESET);
 }
 
-/* ── I2C1: MPU-6050, PB8/PB9, 400 кГц ─────────────────────*/
+/* ── I2C1: PB6=SCL, PB7=SDA, Fast Mode 400 кГц ─────────────*/
 static void MX_I2C1_Init(void)
 {
     __HAL_RCC_I2C1_CLK_ENABLE();
     __HAL_RCC_GPIOB_CLK_ENABLE();
 
     GPIO_InitTypeDef gpio = {0};
-    gpio.Pin       = GPIO_PIN_8 | GPIO_PIN_9;
+    gpio.Pin       = GPIO_PIN_6 | GPIO_PIN_7;
     gpio.Mode      = GPIO_MODE_AF_OD;
     gpio.Pull      = GPIO_NOPULL;
     gpio.Speed     = GPIO_SPEED_FREQ_HIGH;
@@ -153,12 +164,12 @@ static void MX_I2C1_Init(void)
     HAL_GPIO_Init(GPIOB, &gpio);
 
     hi2c1.Instance             = I2C1;
-    hi2c1.Init.ClockSpeed      = 400000;
+    hi2c1.Init.ClockSpeed      = 400000U;
     hi2c1.Init.DutyCycle       = I2C_DUTYCYCLE_2;
     hi2c1.Init.OwnAddress1     = 0;
     hi2c1.Init.AddressingMode  = I2C_ADDRESSINGMODE_7BIT;
     hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
     hi2c1.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
     hi2c1.Init.NoStretchMode   = I2C_NOSTRETCH_DISABLE;
-    HAL_I2C_Init(&hi2c1);
+    if (HAL_I2C_Init(&hi2c1) != HAL_OK) Error_Handler();
 }

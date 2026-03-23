@@ -39,12 +39,9 @@
 #define PID_OUTPUT_MIN             -1.0f
 #define PID_INTEGRAL_MAX            5.0f
 
-#define IMU_I2C_ADDR                (0x68U << 1)
-#define IMU_I2C_TIMEOUT_MS          1U
-#define IMU_ACCEL_FS_G              2
-#define IMU_GYRO_FS_DPS             250
-#define IMU_DLPF_CFG                3
-#define IMU_SMPLRT_DIV              1U
+/* IMU: встроенный LIS3DSH/LIS302DL, SPI1, CS=PE3 */
+#define IMU_CS_PORT                 GPIOE
+#define IMU_CS_PIN                  GPIO_PIN_3
 
 #define CMD_TIMEOUT_MS              500U
 
